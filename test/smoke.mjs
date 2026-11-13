@@ -144,17 +144,35 @@ function loadClient({ primitives, react } = {}) {
       current = next
       const original = next.document.createElement
       const installed = options.fontsInstalled || []
+      const equalWidthInstalled = options.equalWidthInstalled || []
+      const alphaDifferentInstalled = options.alphaDifferentInstalled || []
+      const rasterThrows = options.rasterThrows === true
+      const currentFamily = (font) => {
+        const quoted = /"([^"]+)"/.exec(font)
+        return quoted === null ? 'monospace' : quoted[1]
+      }
+      const isRecognized = (family) => installed.includes(family) || equalWidthInstalled.includes(family)
       next.document.createElement = (tag) => {
         if (tag !== 'canvas') return original(tag)
         const ctx = {
           font: '',
+          _lastText: '',
           measureText: (text) => {
-            const quoted = /"([^"]+)"/.exec(ctx.font)
-            const family = quoted === null ? 'monospace' : quoted[1]
+            const family = currentFamily(ctx.font)
             const base = text.length * 10
             // 明确不存在的族名 → 基线；装了候选族 → 宽度不同（familyInstalled 就是这么判的）
             if (family === '__dsh_ux_no_such_family__') return { width: base }
             return { width: installed.includes(family) ? text.length * 7 : base }
+          },
+          clearRect: () => {},
+          fillText: (text) => { ctx._lastText = text },
+          getImageData: () => {
+            if (rasterThrows) throw new Error('mock raster failed')
+            const family = currentFamily(ctx.font)
+            const matchesFallback = (family === '__dsh_ux_no_such_family__') || !isRecognized(family)
+            const glyphShift = (!matchesFallback && alphaDifferentInstalled.includes(family)) ? 40 : 0
+            const textShift = (ctx._lastText.length * 3) % 20
+            return { data: Uint8ClampedArray.from([0, 0, 0, 80 + textShift + glyphShift, 0, 0, 0, 120 + textShift + glyphShift]) }
           },
         }
         return { getContext: () => ctx }
@@ -711,6 +729,19 @@ test('字体探测：装了才判存在；同名族不同字重也要认（用�
   assert.equal(probe('Sarasa Mono SC'), false)
   assert.equal(probe('Maple Mono'), false)
   assert.equal(probe('Sarasa Gothic SC'), false)
+})
+
+test('字体探测：宽度相同时改用字形 alpha 差异兜底', () => {
+  const options = { equalWidthInstalled: ['Sarasa Mono SC'], alphaDifferentInstalled: ['Sarasa Mono SC'] }
+  const probe = (family) => withDom(client, createDom(), options, () => internals.familyInstalled(family))
+  assert.equal(probe('Sarasa Mono SC'), true, '宽度与回退一致时，alpha 不同也应判定已安装')
+  assert.equal(probe('Sarasa Gothic SC'), false, '未安装字体应继续判定为不存在')
+})
+
+test('字体探测：栅格读取失败时安全回落为未安装', () => {
+  const options = { equalWidthInstalled: ['Sarasa Mono SC'], alphaDifferentInstalled: ['Sarasa Mono SC'], rasterThrows: true }
+  const probe = (family) => withDom(client, createDom(), options, () => internals.familyInstalled(family))
+  assert.equal(probe('Sarasa Mono SC'), false)
 })
 
 test('方案可用性：off 永远可用；其余按候选族或语义判定', () => {
