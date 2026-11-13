@@ -203,8 +203,10 @@ Open **Settings → 界面增强** (Interface Enhancements). That page holds eve
 | Balance and usage | The balance/current-cost row, peak badge, and chart disappear, and the balance endpoint is no longer polled |
 
 **Everything applies instantly; nothing needs a restart.** Switches are projected onto `data-dsh-ux-*`
-attributes on `<html>` (the CSS gates) and persisted in a cookie so the host half can restore them before
-the first paint (otherwise the official palette would flash for one frame).
+attributes on `<html>` (the CSS gates) and written by the host half to `~/.dsh/dsh-uxexo/settings.json`.
+The host reads this file before first paint, preserving the complete state across restarts. Cookies are kept
+for migration and compatibility fallback, not as the only storage. If the settings file cannot be written,
+the client logs a warning and keeps the cookie copy.
 
 The only restart case is **updating the plugin itself**: the client half is replaced by a page reload or
 client hot reload, while the host half (the `/enh/*` endpoints and the first-paint injection) is loaded by
