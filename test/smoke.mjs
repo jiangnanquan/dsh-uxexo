@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
 import assert from 'node:assert/strict'
-import { normalizeSettings, readSettings, writeSettings } from '../lib/config-store.js'
+import { DEFAULT_SETTINGS, ENUM_DEFAULTS, ENUM_KEYS, FEATURE_DEFAULTS, FEATURE_KEYS, THEME_KEYS, normalizeSettings, readSettings, writeSettings } from '../lib/config-store.js'
 
 const root = new URL('../', import.meta.url)
 const read = (rel) => readFileSync(new URL(rel, root), 'utf8')
@@ -338,6 +338,50 @@ test('初始状态：宿主标记的磁盘设置优先于可能过期的 cookie'
   assert.equal(restored.layout, false)
   assert.equal(restored.fold, true)
   assert.equal(restored.font, 'sans-term')
+})
+
+test('静默迁移：磁盘尚未落盘但存在旧 cookie 时，启动自动回填宿主文件；磁盘已有或纯新装不误写', async () => {
+  // 1. 磁盘尚无文件 + 浏览器有旧 cookie → 启动即静默回填并置上 disk 标记
+  const cookieDom = createDom()
+  const raw = { master: false, theme: 'kanagawa-wave', font: 'sans-term', layout: false, fold: true, usage: false }
+  cookieDom.document.cookie = 'dsh-uxexo-config=' + internals.serializeState(raw)
+  const sent = []
+  const post = (_url, options) => {
+    sent.push(JSON.parse(options.body).settings)
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true }) })
+  }
+  const migrated = withDom(client, cookieDom, {}, () => internals.migrateCookieToHostIfNeeded((state) => internals.saveSettingsToHost(state, post)))
+  assert.ok(migrated !== null, '存在旧 cookie 且磁盘未标记时应触发静默回填')
+  await migrated
+  assert.equal(sent.length, 1)
+  const expected = { ...internals.normalizeState(raw) }
+  assert.deepEqual(sent[0], expected)
+  assert.equal(cookieDom.attributes.get('data-dsh-ux-config-source'), 'disk')
+  assert.deepEqual(JSON.parse(cookieDom.attributes.get('data-dsh-ux-config-state')), expected)
+
+  // 2. 1.7.x 遗留的 dsh-enhance-theme=off 同样静默回填
+  const legacyDom = createDom({ 'data-dsh-ux-theme': 'off' })
+  legacyDom.document.cookie = 'dsh-enhance-theme=off'
+  const legacySent = []
+  const legacyMigrated = withDom(client, legacyDom, {}, () => internals.migrateCookieToHostIfNeeded((state) => { legacySent.push(state); return Promise.resolve() }))
+  assert.ok(legacyMigrated !== null)
+  assert.equal(legacySent.length, 1)
+  assert.equal(legacySent[0].theme, 'off')
+
+  // 3. 磁盘已有配置 → 不被旧 cookie 反向覆盖
+  const diskDom = createDom({ 'data-dsh-ux-config-source': 'disk' })
+  diskDom.document.cookie = 'dsh-uxexo-config=' + internals.serializeState({ theme: 'solarized-light' })
+  let diskCalled = 0
+  const skippedDisk = withDom(client, diskDom, {}, () => internals.migrateCookieToHostIfNeeded(() => { diskCalled += 1 }))
+  assert.equal(skippedDisk, null)
+  assert.equal(diskCalled, 0)
+
+  // 4. 全新安装（既无磁盘也无 cookie）→ 不平白生成配置文件
+  const freshDom = createDom()
+  let freshCalled = 0
+  const skippedFresh = withDom(client, freshDom, {}, () => internals.migrateCookieToHostIfNeeded(() => { freshCalled += 1 }))
+  assert.equal(skippedFresh, null)
+  assert.equal(freshCalled, 0)
 })
 
 test('store.set 同时改写 html 属性和 cookie（即时开关的两条腿）', () => {
@@ -1165,12 +1209,24 @@ test('首帧脚本与客户端半的属性口径一致（同名同值）', () =>
   assert.equal(fromScript.size, dom.attributes.size, '两边写入的属性集合必须完全相同')
 })
 
-test('枚举白名单：宿主半与客户端半的主题/字体/字重/墨色集合一致', () => {
-  const hostEnums = read('lib/index.js')
-  for (const key of internals.THEME_KEYS) assert.ok(hostEnums.includes(`'${key}'`), '宿主半白名单缺少主题: ' + key)
-  for (const key of internals.FONT_SCHEME_KEYS) assert.ok(hostEnums.includes(`'${key}'`), '宿主半白名单缺少方案: ' + key)
-  for (const key of internals.FONT_WEIGHT_KEYS) assert.ok(hostEnums.includes(`'${key}'`), '宿主半白名单缺少字重: ' + key)
-  for (const key of internals.INK_SCHEME_KEYS) assert.ok(hostEnums.includes(`'${key}'`), '宿主半白名单缺少墨色: ' + key)
+test('枚举白名单：宿主半 SSOT（config-store）与客户端半的主题/字体/字重/墨色/默认状态完全一致', () => {
+  assert.deepEqual([...FEATURE_KEYS], [...internals.BOOL_KEYS])
+  assert.deepEqual([...THEME_KEYS].sort(), [...internals.THEME_KEYS].sort())
+  assert.deepEqual([...ENUM_KEYS.theme].sort(), [...internals.ENUM_KEYS.theme].sort())
+  assert.deepEqual([...ENUM_KEYS.font].sort(), [...internals.FONT_SCHEME_KEYS].sort())
+  assert.deepEqual([...ENUM_KEYS.font].sort(), [...internals.ENUM_KEYS.font].sort())
+  assert.deepEqual([...ENUM_KEYS.fontweight].sort(), [...internals.FONT_WEIGHT_KEYS].sort())
+  assert.deepEqual([...ENUM_KEYS.ink].sort(), [...internals.INK_SCHEME_KEYS].sort())
+  assert.deepEqual({ ...DEFAULT_SETTINGS }, { ...internals.DEFAULT_STATE })
+  for (const [key, value] of Object.entries(FEATURE_DEFAULTS)) assert.equal(internals.DEFAULT_STATE[key], value, key)
+  for (const [key, value] of Object.entries(ENUM_DEFAULTS)) assert.equal(internals.DEFAULT_STATE[key], value, key)
+
+  // lib/index.js 必须从 config-store.js 导入白名单（不再各自维护重复数组），且 THEME_TONES 覆盖全部主题
+  const hostIndex = read('lib/index.js')
+  assert.ok(!hostIndex.includes('const THEME_KEYS ='), 'lib/index.js 不应重复声明 THEME_KEYS')
+  assert.ok(!hostIndex.includes('const ENUM_KEYS ='), 'lib/index.js 不应重复声明 ENUM_KEYS')
+  for (const key of internals.THEME_KEYS) assert.ok(hostIndex.includes(key === 'off' ? 'off:' : `'${key}':`), 'THEME_TONES 缺少主题: ' + key)
+
   assert.deepEqual([...internals.ENUM_KEYS.theme].sort(), [...internals.THEME_KEYS].sort())
   assert.deepEqual(
     [...internals.ENUM_KEYS.font].sort(),
