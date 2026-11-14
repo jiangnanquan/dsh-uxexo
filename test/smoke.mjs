@@ -9,9 +9,13 @@
  *
  * 跑法：node test/smoke.mjs
  */
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { EventEmitter } from 'node:events'
 import vm from 'node:vm'
 import assert from 'node:assert/strict'
+import { normalizeSettings, readSettings, writeSettings } from '../lib/config-store.js'
 
 const root = new URL('../', import.meta.url)
 const read = (rel) => readFileSync(new URL(rel, root), 'utf8')
@@ -114,7 +118,9 @@ function loadClient({ primitives, react } = {}) {
   const sandbox = {
     window: { __ModuleLoader__: { load: (reg) => { registration = reg } } },
     console,
-    fetch: () => Promise.reject(new Error('offline')),
+    fetch: (_url, options) => options?.headers?.['x-dsh-plugin'] === 'dsh-uxexo'
+      ? Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true }) })
+      : Promise.reject(new Error('offline')),
     MutationObserver: class { observe() {} disconnect() {} },
     ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
     requestAnimationFrame: (fn) => fn(),
@@ -318,6 +324,20 @@ test('初始状态以 cookie 为准：总开关关过一轮，分项选择不能
   assert.equal(legacy.theme, 'off')
   assert.equal(legacy.master, true)
   assert.equal(legacy.fold, true)
+})
+
+test('初始状态：宿主标记的磁盘设置优先于可能过期的 cookie', () => {
+  const diskState = internals.normalizeState({ master: false, theme: 'kanagawa-wave', layout: false, fold: true, font: 'sans-term' })
+  const staleCookie = internals.normalizeState({ master: true, theme: 'solarized-light', layout: true, fold: false, font: 'auto' })
+  const dom = createDom({ 'data-dsh-ux-config-source': 'disk' })
+  dom.document.cookie = 'dsh-uxexo-config=' + internals.serializeState(staleCookie)
+  withDom(client, dom, {}, () => internals.applyStateToDom(diskState))
+  const restored = withDom(client, dom, {}, () => internals.initialState())
+  assert.equal(restored.master, false)
+  assert.equal(restored.theme, 'kanagawa-wave')
+  assert.equal(restored.layout, false)
+  assert.equal(restored.fold, true)
+  assert.equal(restored.font, 'sans-term')
 })
 
 test('store.set 同时改写 html 属性和 cookie（即时开关的两条腿）', () => {
@@ -950,13 +970,31 @@ test('宿主半探测：200+JSON 算同步；404 / 200+HTML / 缺 build 都算�
 const host = await import(new URL('lib/index.js', root))
 const hostSource = read('lib/index.js')
 
+test('宿主设置存储：规范化、原子落盘并可跨重建读取', () => {
+  const home = mkdtempSync(join(tmpdir(), 'uxexo-settings-'))
+  try {
+    assert.equal(readSettings({ home }), null)
+    const saved = writeSettings({ theme: 'kanagawa-wave', layout: false, font: 'sans-term', ignored: 'not persisted' }, { home })
+    assert.equal(saved.theme, 'kanagawa-wave')
+    assert.equal(saved.layout, false)
+    assert.equal(saved.font, 'sans-term')
+    assert.equal('ignored' in saved, false)
+    assert.deepEqual(readSettings({ home }), saved)
+    writeSettings({ ...saved, master: false }, { home })
+    assert.equal(readSettings({ home }).master, false, '重复写入应原子替换旧设置')
+    assert.equal(normalizeSettings({ theme: 'not-a-theme' }).theme, 'solarized-light')
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
 /** apply 宿主半，返回它注册的路由与首帧注入行。 */
-function applyHost() {
+function applyHost({ expectedOrigin } = {}) {
   const routes = []
   const handlers = []
   host.apply({
     get: () => undefined,
-    reflect: { get: (name) => (name === 'webServer' ? { register: (route) => routes.push(route) } : undefined) },
+    reflect: { get: (name) => (name === 'webServer' ? { register: (route) => routes.push(route), getOrigin: () => expectedOrigin } : undefined) },
     on: (event, handler) => { if (event === 'webserver/index-inject') handlers.push(handler) },
   })
   const table = []
@@ -964,11 +1002,11 @@ function applyHost() {
   return { routes, table }
 }
 
-test('宿主半：注册 5 条路由，含 /enh/ping 与 /enh/calendar，且构建号取自 package.json', () => {
+test('宿主半：注册 6 条路由，含 /enh/config、/enh/ping 与 /enh/calendar，且构建号取自 package.json', () => {
   const { routes, table } = applyHost()
   assert.deepEqual(
     routes.map((r) => r.path).sort(),
-    ['/enh/balance', '/enh/calendar', '/enh/ping', '/enh/session-usage', '/enh/usage'],
+    ['/enh/balance', '/enh/calendar', '/enh/config', '/enh/ping', '/enh/session-usage', '/enh/usage'],
   )
   assert.ok(routes.every((r) => r.kind === 'exact'))
   assert.equal(table.length, 1)
@@ -982,7 +1020,35 @@ test('宿主半：注册 5 条路由，含 /enh/ping 与 /enh/calendar，且构�
   )
   assert.equal(body.ok, true)
   assert.equal(body.build, JSON.parse(read('package.json')).version)
-  assert.deepEqual(body.routes.slice().sort(), ['/enh/balance', '/enh/calendar', '/enh/session-usage', '/enh/usage'])
+  assert.deepEqual(body.routes.slice().sort(), ['/enh/balance', '/enh/calendar', '/enh/config', '/enh/session-usage', '/enh/usage'])
+})
+
+test('宿主设置路由：仅接受同源插件写入并保存规范化状态', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'uxexo-route-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const { routes } = applyHost({ expectedOrigin: 'http://localhost:1234' })
+    const route = routes.find((entry) => entry.path === '/enh/config')
+    const req = new EventEmitter()
+    req.method = 'POST'
+    req.headers = { 'x-dsh-plugin': 'dsh-uxexo', origin: 'http://127.0.0.1:1234', host: '127.0.0.1:1234' }
+    let status = 0
+    let body = null
+    const res = { writeHead: (code) => { status = code }, end: (text) => { body = JSON.parse(text) } }
+    const pendingWrite = route.handler(req, res)
+    req.emit('data', JSON.stringify({ settings: { theme: 'kanagawa-wave', layout: false, invalid: 'drop' } }))
+    req.emit('end')
+    await pendingWrite
+    assert.equal(status, 200)
+    assert.deepEqual(body, { ok: true })
+    assert.equal(readSettings({ home }).theme, 'kanagawa-wave')
+    assert.equal(readSettings({ home }).layout, false)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    rmSync(home, { recursive: true, force: true })
+  }
 })
 
 /** 在同一份状态上跑首帧脚本，返回它写下的属性表。 */
@@ -998,6 +1064,26 @@ function runFirstPaintScript(script, cookie) {
   vm.runInNewContext(script, sandbox, { filename: 'first-paint.js' })
   return attributes
 }
+
+test('首帧脚本：本机文件优先于过期 cookie，且注入完整原始设置', () => {
+  const home = mkdtempSync(join(tmpdir(), 'uxexo-first-paint-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const saved = writeSettings({ master: false, theme: 'kanagawa-wave', font: 'sans-term', layout: false }, { home })
+    const script = applyHost().table[0].text
+    const attributes = runFirstPaintScript(script, 'dsh-uxexo-config=' + internals.serializeState({ master: true, theme: 'solarized-light' }))
+    assert.equal(attributes.get('data-dsh-ux-config-source'), 'disk')
+    assert.deepEqual(JSON.parse(attributes.get('data-dsh-ux-config-state')), saved)
+    assert.equal(attributes.get('data-dsh-ux'), 'off')
+    assert.equal(attributes.get('data-dsh-ux-theme'), 'off')
+    assert.equal(attributes.get('data-dsh-ux-font'), 'off')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+    rmSync(home, { recursive: true, force: true })
+  }
+})
 
 test('首帧脚本：cookie 缺失 → 默认值正确 + Solarized；关掉的项原样恢复；旧版 cookie 仍认', () => {
   const script = applyHost().table[0].text
