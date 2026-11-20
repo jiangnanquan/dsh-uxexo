@@ -1033,18 +1033,81 @@ test('宿主设置存储：规范化、原子落盘并可跨重建读取', () =>
 })
 
 /** apply 宿主半，返回它注册的路由与首帧注入行。 */
-function applyHost({ expectedOrigin } = {}) {
+function applyHost({ expectedOrigin, connection } = {}) {
   const routes = []
   const handlers = []
+  const defaultConnection = {
+    trusted: true,
+    requestRejection() {
+      if (this.trusted !== true) throw new Error('lost this binding')
+      return undefined
+    },
+  }
+  const activeConnection = connection === undefined ? defaultConnection : connection
   host.apply({
-    get: () => undefined,
-    reflect: { get: (name) => (name === 'webServer' ? { register: (route) => routes.push(route), getOrigin: () => expectedOrigin } : undefined) },
+    connection: activeConnection,
+    get: (name) => (name === 'connection' ? activeConnection : undefined),
+    reflect: {
+      get: (name) => {
+        if (name === 'webServer') return { register: (route) => routes.push(route), getOrigin: () => expectedOrigin }
+        if (name === 'connection') return activeConnection
+        return undefined
+      },
+    },
     on: (event, handler) => { if (event === 'webserver/index-inject') handlers.push(handler) },
   })
   const table = []
   for (const handler of handlers) handler(table)
   return { routes, table }
 }
+
+test('宿主半：导出 inject 含 connection，且全部 6 条路由均强制执行 requestRejection 鉴权（含 fail-closed）', async () => {
+  assert.ok(Array.isArray(host.inject) && host.inject.includes('connection'), '宿主半必须导出包含 connection 的 inject')
+
+  const ALL_ROUTES = ['/enh/balance', '/enh/calendar', '/enh/config', '/enh/ping', '/enh/session-usage', '/enh/usage']
+  const runAll = async (connection, expectedStatus) => {
+    const called = []
+    const { routes } = applyHost({ connection })
+    for (const path of ALL_ROUTES) {
+      const route = routes.find((r) => r.path === path)
+      assert.ok(route, '缺少路由: ' + path)
+      let status = 0
+      let body = null
+      const req = { method: path === '/enh/config' ? 'POST' : 'GET', url: path, headers: { 'x-dsh-plugin': 'dsh-uxexo' } }
+      const res = {
+        writeHead: (code) => { status = code },
+        setHeader() {},
+        end: (text) => { body = JSON.parse(text) },
+      }
+      await route.handler(req, res)
+      called.push({ path, status, body })
+    }
+    for (const item of called) {
+      assert.equal(item.status, expectedStatus, `${item.path} 应返回 HTTP ${expectedStatus}`)
+      assert.equal(item.body.ok, false)
+    }
+  }
+
+  // 1. 未登录 → 401
+  const auth401 = {
+    code: 401,
+    requestRejection() { return this.code },
+  }
+  await runAll(auth401, 401)
+
+  // 2. Host/Origin 不可信 → 403
+  const origin403 = {
+    code: 403,
+    requestRejection() { return this.code },
+  }
+  await runAll(origin403, 403)
+
+  // 3. connection 缺失 → fail-closed 返回 403
+  await runAll(null, 403)
+
+  // 4. requestRejection 抛错 → fail-closed 返回 403
+  await runAll({ requestRejection() { throw new Error('boom') } }, 403)
+})
 
 test('宿主半：注册 6 条路由，含 /enh/config、/enh/ping 与 /enh/calendar，且构建号取自 package.json', () => {
   const { routes, table } = applyHost()
